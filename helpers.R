@@ -4,6 +4,8 @@ do.cache <- function(FUN, ..., cache.file = "last_call.RData", cache.force = F){
   if (!file.exists(cache.file) | cache.force){
     cat(sprintf("Caching result to %s...", cache.file))
     result = FUN(...)
+    # make sure the file is removed before we store the new one
+    if (file.exists(cache.file)){ file.remove(cache.file) }
     saveRDS(
       object = result, 
       file = cache.file
