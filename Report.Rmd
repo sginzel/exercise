@@ -1,0 +1,274 @@
+---
+title: "Report"
+author: "Sebastian Ginzel"
+date: "22 Oktober 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+
+## Environment
+
+Let's make sure we have the proper environment setup. The repository contains a packrat environment, that should be loaded before we proceed. It includes the local_cran folder as a repository to install from. 
+
+To do this we first have to download the IBB package from oncoproteomics, that we are going to use later for the DE analysis. 
+
+```{r ibbdownload}
+if (!dir.exists("./local_cran")) dir.create("./local_cran")
+if (!require("ibb")){
+  if (!file.exists("./local_cran/ibb.tar.gz")){
+    ibbarchive = file.path(".", "local_cran", "ibb.tar.gz")
+    ibb.conf = read.dcf("./ibb.dcf", all=T)
+    stopifnot(R.version$os == ibb.conf$os || as.integer(R.version$major) < 3)
+    download.file(ibb.conf$url, ibbarchive)
+    untar(ibbarchive, exdir = "./local_cran")
+    install_local("ibb")
+  }
+}
+```
+
+```{r load_requirements, message=FALSE, warning=FALSE}
+require(ibb, quietly = T)
+require(magrittr, quietly = T)
+require(ggplot2, quietly = T)
+require(multtest, quietly = T)
+require(ComplexHeatmap, quietly = T)
+require(VennDiagram, quietly = T)
+require(writexl, quietly = T)
+source("helpers.R")
+
+# Threads to use as part of the ibb.test function
+NTHREADS = 7
+
+```
+
+
+## Load data
+```{r load_table}
+tbl = read.table("./raw_data.tsv", sep="\t", header=T) %>% as.matrix
+# lets add row names, so we can later track the filtered results back to the raw data - which is difficult just using indexes
+rownames(tbl) = 1:nrow(tbl) %>% as.hexmode %>% format(.,width=4) 
+tbl.complete = tbl[complete.cases(tbl) & apply(tbl >= 0, 1, all), ] # a very strict table of complete cases, where all values are > 0
+malig.cols = colnames(tbl) %>% grepl(pattern = "m$", x = .)
+total.cols = colnames(tbl) %>% grepl(pattern = "t$", x = .)
+decem.cols = colnames(tbl) %>% grepl(pattern = "^December", x = .)
+augus.cols = colnames(tbl) %>% grepl(pattern = "^August", x = .)
+```
+
+## Data Exploration
+Foreign experiment data is can be messy in one way or the another, let us first find out if there are any issues that need to be resolved. 
+
+```{r data_explore}
+summary(tbl)
+```
+
+## Data Cleaning
+There are a lot of NA values. We will treat these data points as absent, resulting in 0 count.
+Furthermore, we will remove lines that only contain 0 for total counts. 
+
+There are negative and infinite values in the table. Negative counts do not make sense for absolute count data, infinite values may be introduced by pre-processing errors. We will remove rows that contain such values
+```{r data_clean}
+do_clean <- function(mtrx){
+  mtrx[is.infinite(mtrx)] = NA
+  mtrx[is.na(mtrx)] = 0
+  mtrx = (rowSums(mtrx[,total.cols & augus.cols]) > 0 & # total count for august > 0
+               rowSums(mtrx[,total.cols & decem.cols]) > 0 & # total count for december > 0
+               rowSums(mtrx[,malig.cols]) > 0                # any data on malignant isoforms available
+              ) %>% mtrx[.,]
+}
+tbl.clean = do_clean(tbl)
+sprintf("%.2f%% rows have valid total counts.\n", round(nrow(tbl.clean)/nrow(tbl),3)*100) %>% cat
+```
+
+### Data Exploration Clustering
+To have a look at the consistency of the replicates we generate a bi-plot of the malignant frequency per sample. If all replicates are structured the same, we expect the bi-plot to show us one or two clusters. One cluster containing all replicates would indicate only little support for actual difference between the groups. Two clusters, that seperate August and December would show us, that there are differences we can discovery using a DEG method. In case there are more clusters, or the clusters do not seperate August and December we may need to adjust our analysis. 
+
+```{r data_explore_pca}
+# calcluate malignant frequncy per replicate
+malig.frac = (t(tbl.complete[,malig.cols]) * 1.0/colSums(tbl.complete[,total.cols])) %>% t
+pca = prcomp(t(malig.frac))
+summary(pca)
+# The frequncies can be really small, so R will warn us that it is unable to plot very short arrows
+suppressWarnings(biplot(pca, cex=0.8))
+plot(hclust(dist(malig.frac %>% t)))
+# create heatmap for top 150 varying isoforms - so we can have a look at August_4m and December_1m
+apply(malig.frac, 1, var) %>%  sort(., decreasing = T) %>% head(n = 150) %>% names %>% malig.frac[.,] %>% log10 %>% 
+  Heatmap(., name = "Top 150\nvarying\nMalig. Fraction\nlog10", show_row_names=F)
+
+is.outlier = (colnames(tbl) %>% grepl("(August_3[mt]|December_1[mt])$", .))
+```
+The biplot (and the equivalent hierarchical clustering) show that the December replicates are relatively consistend - the first 2 principal components explain 72% of the variance, so this biplot is not a bad embedding. 
+Principal component 1 seperates August and December quite well, so we can expect to find significantly different isoforms. 
+
+The August_4m and December_1m replicates however are seperated completely by the second principal component, suggesting that these replicates may introduce more variance than they should. We can get an idea of this by looking at the top varying isoforms (n=150) and see if there are systematical differences in the outlier candidates. Overall August_4m and December_1m show quite similar patterns as their replicates and only few isoforms may contribute to the variance.
+
+As we have no biological or experimental data available for further interpretation, we will just keep this in mind for later and perform DE analysis with and without outliers.
+
+## DE Analysis Using IBB
+Since the pairs are not matched, we need to aggregate the replicates. We do this using `mean` to cacluclate the group wise average counts. I assume the data are actual non-normalized count data, if they were normalized we should use geometric mean. 
+
+The ibb.test method is quite computational expensive, so we will use the `do.cache` method from the helpers.R script, to provide some simple caching for us. 
+
+```{r ibbtest, include=F, message=FALSE }
+
+do_ibb <- function(tbl2test, ...){
+  # Make sure there are only valid input in tbl.test - this may not be the case when replicates are removed
+  tbl2test = tbl2test[apply(tbl2test, 1, function(x){!any(is.na(x))}),]
+  tbl2test = tbl2test[apply(tbl2test, 1, function(x){all(x>0.0)}),]
+  ibb.result = do.cache(...,
+                      FUN = ibb.test, 
+                      x = tbl2test[,1:2], 
+                      tx = tbl2test[,3:4], 
+                      group = c("August", "December"),
+                      n.threads = NTHREADS
+                      ) %>% as.data.frame
+  pval.correction = multtest::mt.rawp2adjp(ibb.result$p.value, c("Bonferroni", "BH"))
+  ibb.result = cbind(ibb.result, pval.correction$adjp[order(pval.correction$index),])
+  rownames(ibb.result) = rownames(tbl2test)
+  stopifnot(all(ibb.result$p.value == ibb.result$rawp)) # sanity check to make sure we didn't forget the order() operation on adjusted P
+  ibb.result$rawp = NULL
+  ibb.result
+}
+
+tbl.test = data.frame(
+  august.malig = rowMeans(tbl.clean[,malig.cols & augus.cols]),
+  decmbr.malig = rowMeans(tbl.clean[,malig.cols & decem.cols]),
+  august.total = rowMeans(tbl.clean[,total.cols & augus.cols]),
+  decmbr.total = rowMeans(tbl.clean[,total.cols & decem.cols])
+) 
+ibb.result = do_ibb(tbl.test, cache.file = "ibb_result.RData", cache.force = F)
+```
+
+Lets do the same calculation without the outlier identified earlier. 
+```{r ibbtest_noutlier, include=F, message=FALSE}
+tbl.test.nooutlier = data.frame(
+  august.malig = rowMeans(tbl.clean[,malig.cols & augus.cols & !is.outlier]),
+  decmbr.malig = rowMeans(tbl.clean[,malig.cols & decem.cols & !is.outlier]),
+  august.total = rowMeans(tbl.clean[,total.cols & augus.cols & !is.outlier]),
+  decmbr.total = rowMeans(tbl.clean[,total.cols & decem.cols & !is.outlier])
+) 
+ibb.result.nooutlier = do_ibb(tbl.test.nooutlier, cache.file = "ibb_result_noutlier.RData", cache.force = F)
+```
+
+### DE Result Analysis
+After perform the beta-binomial test we should check if there are actually any differences found between the groups. 
+
+```{r build_result, echo=F}
+ibb.result$name = row.names(ibb.result)
+ibb.result.nooutlier$name = row.names(ibb.result.nooutlier)
+result = merge(ibb.result, ibb.result.nooutlier, suffixes = c("", ".nooutlier"), by="name", all.x = T)
+row.names(result) = result$name
+```
+
+#### Histogram of p-values
+Check if p-values reflect a siginificant change.
+```{r ibbcheck_pvaldist, echo=F}
+hist(ibb.result$p.value, breaks=seq(0,1,by=0.01), main = "P-value distribution", xlab="p-value")
+abline(v=0.05, lwd=2, col="blue")
+text(x=0.05, y=0, "alpha = 0.05", adj = c(-0.1,1.2), cex=0.8, col="blue")
+```
+
+The p-values are not evenly distributed, which is more evidence for the previous conclusion we drew from the biplot, that we can find significant changes. However the p-value distribution peaks around 0.03 and then falls off towards 0, which may be a property of the test statistic and the reason why multiple testing correction does not yield any significant isoforms. 
+
+With information about the biological background of the data and the isoform transcripts, we could further look into investigating how house keeping proteins behave in the test and do a sanity check, because these should not be significantly different between August and December. 
+
+#### Volcano plot
+We can also have a look at the fold change and p-value distribution using a volcano plot. 
+
+```{r volcano_plot}
+{
+  with(ibb.result, plot(fc , -log10(p.value), xlab="Log FC", ylab="-log10(pvalue)", pch=20, main = "Volcano plot"))
+  with(subset(ibb.result, abs(fc)>1 & p.value < 0.05), points(fc, -log10(p.value), col="salmon", pch=20))
+  with(subset(ibb.result, abs(fc)>2 & p.value < 0.05), points(fc, -log10(p.value), col="lightgoldenrod", pch=20))
+  with(subset(ibb.result, abs(fc)>2 & p.value < 0.01), points(fc, -log10(p.value), col="palegreen", pch=20))
+}
+```
+All siginficant fold changes > 1 are marked red, they are subsequently marked yellow if they exceed fold change of 2. Those that exceed a fold change of 2 and the p-value threshold of 1% are marked green.
+From this plot we can see that the significant changes are more or less evenly up/down regulated. The fold changes themselves are also within similar orders of magnitude, which otherwise may indicate a very strong singular effect. 
+
+
+#### Venndiagram with/without outliers
+To see how much influence the outliers have on the overall result we can show a venn diagram of the common/exclusive results. 
+
+TODO: Compare fold changes and p-values of those isoforms that are affected by the outliers. They may be close to each other, which would support that we dont need to take any action. They may also fall within another significance interval, which just means we get more or less support. 
+
+```{r venndiagram, height=10}
+grid.newpage()
+list(
+  "Incl. Aug4 & Dec1" = subset(ibb.result          , p.value<0.01 & abs(fc) > 2) %>% rownames(),
+  "Excl. Aug4 & Dec1" = subset(ibb.result.nooutlier, p.value<0.01 & abs(fc) > 2) %>% rownames()
+) %>% venn.diagram(., filename = NULL, main = "Comparison of outlier influence", alpha=0.8, fill=c("steelblue", "gold"), margin=.1) %>% grid.draw(.)
+
+sigset1 = subset(result, p.value < 0.01 & abs(fc)>2)$name
+sigset2 = subset(result, p.value.nooutlier < 0.01 & abs(fc.nooutlier)>2)$name
+difference.outliers = c(setdiff(sigset1, sigset2),setdiff(sigset2, sigset1)) 
+(t(tbl.clean[difference.outliers,malig.cols])*(1/colSums(tbl.clean[difference.outliers,total.cols]))) %>% t %>% Heatmap(., clustering_method_columns="single", row_names_gp = gpar(fontsize=8))
+
+Heatmap(result[result$name %in% difference.outliers,c("fc","fc.nooutlier")])
+data2plot = subset(result, name %in% difference.outliers)
+data2plot$fc.change = with(data2plot, fc-fc.nooutlier)
+data2plot$pval.change = with(data2plot, log(p.value/p.value.nooutlier))
+g = ggplot(data = data2plot, aes(x=pval.change, y=fc.change, label=name)) + 
+  geom_rect(xmin=log(0.5), xmax=log(2), ymin=-1, ymax=1, color="palegreen", alpha=0.1, fill = rgb(0.43,1,0.43,0.5)) +
+  geom_point(col="grey") +
+  geom_text(check_overlap = T) +
+  theme_minimal()
+plot(g)
+```
+Overall the experiment and statistic is robust against inter-replicate variance, showing that a coreset of 81 isoforms is not influenced by the presence/absence of the August4 and December1 replicates. 
+
+However 20 are gained by excluding August4 & December1 and 11 gained by including them. 
+When we look at the pvalue and fold change drift, that is explained by Aug4 and Dec1 we can see that overall there is little change. The fold change for most measures stays within +/- 1 and the p-value varies between 0.005 and 0.02 - given that 0.02 is still well under the common p-value cutoff of 5% this is tolerateable. 
+
+5 isoforms (2e1a, 3275, 4024, 4a35 and 4b37) are excluded from the plot, because they are only supported by August4 and December1. 
+5 other isoforms (0c76, 08ce, 095f, 383e and 13ba) show changes in their fold change and significance that are explained by August4 and December1, which may be of interest. 
+
+We create a report in excel format which is a lot more convienient to most end-users. 
+
+```{r write_result, echo=F}
+result = ibb.result
+result$is.significant = abs(result$fc) & p.value < 0.01
+result$note = ""
+subset(result, name %in% difference.outliers) = "Influenced by August_4 or December_1"
+
+write_xlsx(x = result.table, path = "list_of_isoforms.xlsx")
+
+write.table(file = "isoform_anayslis.tsv", x = ibb.result)
+ibb.result$name = row.names(ibb.result)
+ibb.result.nooutlier$name = row.names(ibb.result.nooutlier)
+result = merge(ibb.result, ibb.result.nooutlier, suffixes = c("", ".nooutlier"), by="name")
+```
+
+## Summary
+Initial dataset summary revealed a large portion of the dataset to be not suitable for futher analysis. Around 60% of the dataset was removed as a consequence. The resulting 9233 records still hold quite a few zero reads, which we could impute using a compositional approach (e.g. zCompostion::cmultRepl [Martin-Fernandez et al]).
+
+The integrity check revealed that replicates August_4 and December_1 contribute more to the variance than the other replicates. 
+
+We further analyzed the datasets using the inverted beta binomial model provided by the `ibb` package. The p-value distribution showed that some 
+
+[Martin-Fernandez et al] `Martin-Fernandez, J.A., Hron, K., Templ, M., Filzmoser, P., Palarea-Albaladejo, J. Bayesian-multiplicative treatment of count zeros in compositional data sets. Statistical Modelling 2015; 15 (2): 134-158.`
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
